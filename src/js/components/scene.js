@@ -62,15 +62,17 @@ export default class MainScene {
   #virtualCameraMarker2
   #cubeCamera
   #cubeRenderTarget
+  #lastFrameTime = 0
+  #frameInterval = 16.67 // ~60fps
   #guiObj = {
     y: 0,
     showTitle: true,
     showVirtualCameras: false,
     showMirrors: false,
     showAxesHelper: false,
-    flipMirrors: false,
-    mirrorWidth: 1.0,
-    mirrorHeight: 1.0,
+    flipMirrors: true, // Default: flipped mirrors
+    mirrorWidth: 3.0, // Default: 3x width
+    mirrorHeight: 3.0, // Default: 3x height
     mirrorScale: 1.0,
     mirrorShape: 'rectangle',
     mirrorCurvature: 0.0, // 0 = flat, positive = convex, negative = concave
@@ -78,6 +80,9 @@ export default class MainScene {
     animationSpeed: 1.0,
     animationTime: 0.0,
     playAnimation: true,
+    cpuOnly: false, // CPU-only mode (disables GPU-intensive features)
+    lowMemoryMode: false, // Low memory mode for Smart TVs and low-end devices
+    targetFPS: 60, // Target FPS (30 for low-end devices)
     exportGLTF: () => this.exportSceneToGLTF(),
     exportSettings: () => this.exportSettings(),
     importSettings: () => this.importSettings(),
@@ -91,6 +96,9 @@ export default class MainScene {
   }
 
   init = async () => {
+    // Load CPU mode setting first
+    this.loadCPUModeSetting()
+    
     // Preload assets before initiating the scene
     const assets = [
       {
@@ -129,8 +137,18 @@ export default class MainScene {
   setRender() {
     this.#renderer = new WebGLRenderer({
       canvas: this.#canvas,
-      antialias: true,
+      antialias: !this.#guiObj.cpuOnly && !this.#guiObj.lowMemoryMode,
+      powerPreference: (this.#guiObj.cpuOnly || this.#guiObj.lowMemoryMode) ? 'low-power' : 'high-performance',
+      precision: this.#guiObj.lowMemoryMode ? 'lowp' : 'highp', // Low precision for Smart TVs
+      stencil: !this.#guiObj.lowMemoryMode, // Disable stencil buffer in low memory mode
+      depth: true,
+      logarithmicDepthBuffer: false, // Disable for better performance
     })
+    
+    // Disable shadows in low memory mode
+    if (this.#guiObj.lowMemoryMode) {
+      this.#renderer.shadowMap.enabled = false
+    }
   }
 
   /**
@@ -141,14 +159,17 @@ export default class MainScene {
     this.#scene = new Scene()
     this.#scene.background = new Color(0x808080)
     
-    // Setup CubeCamera for environment reflections
-    this.#cubeRenderTarget = new WebGLCubeRenderTarget(256, {
-      generateMipmaps: true,
-      minFilter: LinearMipmapLinearFilter,
-    })
-    
-    this.#cubeCamera = new CubeCamera(0.1, 1000, this.#cubeRenderTarget)
-    this.#scene.add(this.#cubeCamera)
+    // Setup CubeCamera for environment reflections (skip in low memory mode)
+    if (!this.#guiObj.lowMemoryMode) {
+      const cubeSize = this.#guiObj.cpuOnly ? 128 : 256 // Smaller texture in CPU mode
+      this.#cubeRenderTarget = new WebGLCubeRenderTarget(cubeSize, {
+        generateMipmaps: !this.#guiObj.lowMemoryMode,
+        minFilter: LinearMipmapLinearFilter,
+      })
+      
+      this.#cubeCamera = new CubeCamera(0.1, 1000, this.#cubeRenderTarget)
+      this.#scene.add(this.#cubeCamera)
+    }
   }
 
   /**
@@ -165,9 +186,17 @@ export default class MainScene {
     const farPlane = 10000
 
     this.#camera = new PerspectiveCamera(fieldOfView, aspectRatio, nearPlane, farPlane)
-    this.#camera.position.y = 5
-    this.#camera.position.x = 5
-    this.#camera.position.z = 5
+    
+    // Default camera position from saved settings
+    this.#camera.position.x = -0.29616269737491346
+    this.#camera.position.y = 0.5536197835771841
+    this.#camera.position.z = 2.2819253056699145
+    
+    // Default camera rotation
+    this.#camera.rotation.x = -0.1247514335412133
+    this.#camera.rotation.y = -0.13577442993308741
+    this.#camera.rotation.z = -0.016972579045198086
+    
     this.#camera.lookAt(0, 0, 0)
 
     this.#scene.add(this.#camera)
@@ -565,10 +594,14 @@ export default class MainScene {
     // First mirror (front)
     const geometry = new PlaneGeometry(10, 10)
     
+    // Reduce texture resolution in low memory mode
+    const texScale = this.#guiObj.lowMemoryMode ? 0.5 : 1.0
+    const dpr = this.#guiObj.lowMemoryMode ? 1 : (window.devicePixelRatio || 1)
+    
     this.#mirror = new Reflector(geometry, {
       clipBias: 0.003,
-      textureWidth: window.innerWidth * window.devicePixelRatio,
-      textureHeight: window.innerHeight * window.devicePixelRatio,
+      textureWidth: window.innerWidth * dpr * texScale,
+      textureHeight: window.innerHeight * dpr * texScale,
       color: 0x889999,
     })
     
@@ -590,8 +623,8 @@ export default class MainScene {
     
     this.#mirror2 = new Reflector(geometry2, {
       clipBias: 0.003,
-      textureWidth: window.innerWidth * window.devicePixelRatio,
-      textureHeight: window.innerHeight * window.devicePixelRatio,
+      textureWidth: window.innerWidth * dpr * texScale,
+      textureHeight: window.innerHeight * dpr * texScale,
       color: 0x998899,
     })
     
@@ -677,6 +710,20 @@ export default class MainScene {
     }
 
     const gui = new GUI()
+    
+    // Performance controls
+    const performanceFolder = gui.addFolder('Performance')
+    performanceFolder.add(this.#guiObj, 'cpuOnly').name('CPU Only Mode').onChange(() => {
+      alert('Please refresh the page for changes to take effect.')
+      this.savePerformanceSettings()
+    })
+    performanceFolder.add(this.#guiObj, 'lowMemoryMode').name('Low Memory Mode (Smart TV)').onChange(() => {
+      alert('Please refresh the page for changes to take effect.')
+      this.savePerformanceSettings()
+    })
+    performanceFolder.add(this.#guiObj, 'targetFPS', [30, 60]).name('Target FPS').onChange(() => {
+      this.savePerformanceSettings()
+    })
     
     // Model controls
     const modelFolder = gui.addFolder('Model Controls')
@@ -1012,9 +1059,9 @@ export default class MainScene {
     this.#guiObj.showTitle = true
     this.#guiObj.showVirtualCameras = false
     this.#guiObj.showMirrors = false
-    this.#guiObj.flipMirrors = false
-    this.#guiObj.mirrorWidth = 1.0
-    this.#guiObj.mirrorHeight = 1.0
+    this.#guiObj.flipMirrors = true // Default: flipped
+    this.#guiObj.mirrorWidth = 3.0 // Default: 3x
+    this.#guiObj.mirrorHeight = 3.0 // Default: 3x
     this.#guiObj.mirrorScale = 1.0
     this.#guiObj.mirrorShape = 'rectangle'
     this.#guiObj.mirrorCurvature = 0.0
@@ -1022,6 +1069,10 @@ export default class MainScene {
     this.#guiObj.animationSpeed = 1.0
     this.#guiObj.animationTime = 0.0
     this.#guiObj.playAnimation = true
+    
+    // Reset camera to default position
+    this.#camera.position.set(-0.29616269737491346, 0.5536197835771841, 2.2819253056699145)
+    this.#camera.rotation.set(-0.1247514335412133, -0.13577442993308741, -0.016972579045198086)
     
     this.updateGUI()
     
@@ -1189,10 +1240,57 @@ export default class MainScene {
   }
 
   /**
+   * Load CPU mode setting from localStorage
+   */
+  loadCPUModeSetting() {
+    const cpuMode = localStorage.getItem('cpuOnlyMode')
+    const lowMemMode = localStorage.getItem('lowMemoryMode')
+    const fps = localStorage.getItem('targetFPS')
+    
+    if (cpuMode !== null) {
+      this.#guiObj.cpuOnly = cpuMode === 'true'
+    }
+    if (lowMemMode !== null) {
+      this.#guiObj.lowMemoryMode = lowMemMode === 'true'
+    }
+    if (fps !== null) {
+      this.#guiObj.targetFPS = parseInt(fps)
+    }
+    
+    console.log('Performance Settings:', {
+      cpuOnly: this.#guiObj.cpuOnly,
+      lowMemory: this.#guiObj.lowMemoryMode,
+      targetFPS: this.#guiObj.targetFPS
+    })
+  }
+
+  /**
+   * Save performance settings to localStorage
+   */
+  savePerformanceSettings() {
+    localStorage.setItem('cpuOnlyMode', this.#guiObj.cpuOnly.toString())
+    localStorage.setItem('lowMemoryMode', this.#guiObj.lowMemoryMode.toString())
+    localStorage.setItem('targetFPS', this.#guiObj.targetFPS.toString())
+    console.log('Performance settings saved')
+  }
+  
+  /**
+   * Save CPU mode setting to localStorage (legacy support)
+   */
+  saveCPUModeSetting() {
+    this.savePerformanceSettings()
+  }
+
+  /**
    * List of events
    */
   events() {
     window.addEventListener('resize', this.handleResize, { passive: true })
+    
+    // Initialize frame timing for FPS limiting
+    this.#lastFrameTime = performance.now()
+    this.#frameInterval = 1000 / this.#guiObj.targetFPS
+    
     this.draw(0)
   }
 
@@ -1204,14 +1302,24 @@ export default class MainScene {
    * Everything that happens in the scene is drawed here
    * @param {Number} now
    */
-  draw = () => {
-    // now: time in ms
+  draw = (currentTime) => {
+    // FPS limiting for low-end devices
+    const elapsed = currentTime - this.#lastFrameTime
+    
+    if (elapsed < this.#frameInterval) {
+      this.raf = window.requestAnimationFrame(this.draw)
+      return
+    }
+    
+    this.#lastFrameTime = currentTime - (elapsed % this.#frameInterval)
+    
     this.#stats.begin()
 
     if (this.#controls) this.#controls.update() // for damping
     
     // Update CubeCamera for environment reflections (for curved mirrors)
-    if (this.#cubeCamera && this.#cubeRenderTarget && Math.abs(this.#guiObj.mirrorCurvature) > 0.001) {
+    // Skip in CPU-only or low memory mode to reduce GPU load
+    if (!this.#guiObj.cpuOnly && !this.#guiObj.lowMemoryMode && this.#cubeCamera && this.#cubeRenderTarget && Math.abs(this.#guiObj.mirrorCurvature) > 0.001) {
       // Position cube camera at scene center for better environment capture
       this.#cubeCamera.position.set(0, 0, 0)
       
@@ -1277,6 +1385,7 @@ export default class MainScene {
     }
 
     // Update dynamic mirrors' virtual camera markers
+    // In CPU-only mode, skip complex shader uniform updates
     this.#dynamicMirrors.forEach((mirrorData) => {
       const reflector = mirrorData.reflector
       const backing = mirrorData.backing
@@ -1317,7 +1426,8 @@ export default class MainScene {
       }
       
       // Update curved mirror material uniforms if using custom shader
-      if (reflector.material && reflector.material.uniforms) {
+      // Skip in CPU-only or low memory mode to reduce overhead
+      if (!this.#guiObj.cpuOnly && !this.#guiObj.lowMemoryMode && reflector.material && reflector.material.uniforms) {
         if (reflector.material.uniforms.uCameraPosition) {
           reflector.material.uniforms.uCameraPosition.value.copy(this.#camera.position)
         }
@@ -1371,7 +1481,11 @@ export default class MainScene {
     this.#camera.aspect = this.#width / this.#height
     this.#camera.updateProjectionMatrix()
 
-    const DPR = window.devicePixelRatio ? window.devicePixelRatio : 1
+    // Use lower pixel ratio in CPU-only or low memory mode
+    let DPR = 1
+    if (!this.#guiObj.cpuOnly && !this.#guiObj.lowMemoryMode) {
+      DPR = Math.min(window.devicePixelRatio || 1, 2) // Cap at 2x for performance
+    }
 
     this.#renderer.setPixelRatio(DPR)
     this.#renderer.setSize(this.#width, this.#height)
