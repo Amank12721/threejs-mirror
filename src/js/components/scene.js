@@ -17,6 +17,15 @@ import {
   Vector3,
   Quaternion,
   AnimationMixer,
+  CircleGeometry,
+  Shape,
+  ShapeGeometry,
+  Box3,
+  CubeCamera,
+  WebGLCubeRenderTarget,
+  LinearMipmapLinearFilter,
+  ShaderMaterial,
+  DoubleSide,
 } from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js'
@@ -25,6 +34,10 @@ import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import Stats from 'stats-js'
 import LoaderManager from '@/js/managers/LoaderManager'
 import GUI from 'lil-gui'
+
+// Import shaders
+import curvedMirrorVertexShader from '@/js/glsl/curved-mirror.vert?raw'
+import curvedMirrorFragmentShader from '@/js/glsl/curved-mirror.frag?raw'
 
 export default class MainScene {
   #canvas
@@ -47,6 +60,8 @@ export default class MainScene {
   #dynamicMirrors = [] // Array to store dynamically created mirrors
   #virtualCameraMarker
   #virtualCameraMarker2
+  #cubeCamera
+  #cubeRenderTarget
   #guiObj = {
     y: 0,
     showTitle: true,
@@ -56,6 +71,10 @@ export default class MainScene {
     flipMirrors: false,
     mirrorWidth: 1.0,
     mirrorHeight: 1.0,
+    mirrorScale: 1.0,
+    mirrorShape: 'rectangle',
+    mirrorCurvature: 0.0, // 0 = flat, positive = convex, negative = concave
+    mirrorRadius: 5.0, // radius of curvature
     animationSpeed: 1.0,
     animationTime: 0.0,
     playAnimation: true,
@@ -121,6 +140,15 @@ export default class MainScene {
   setScene() {
     this.#scene = new Scene()
     this.#scene.background = new Color(0x808080)
+    
+    // Setup CubeCamera for environment reflections
+    this.#cubeRenderTarget = new WebGLCubeRenderTarget(256, {
+      generateMipmaps: true,
+      minFilter: LinearMipmapLinearFilter,
+    })
+    
+    this.#cubeCamera = new CubeCamera(0.1, 1000, this.#cubeRenderTarget)
+    this.#scene.add(this.#cubeCamera)
   }
 
   /**
@@ -210,6 +238,9 @@ export default class MainScene {
         this.#model.name = 'MainModel'
         this.#scene.add(this.#model)
         console.log('Model loaded successfully!')
+        
+        // Auto-fit camera to model
+        this.fitCameraToModel()
         
         // Setup animations if they exist
         if (gltf.animations && gltf.animations.length > 0) {
@@ -344,20 +375,44 @@ export default class MainScene {
           console.log('⚠️ Mirror will be flipped (180°)')
         }
         
-        // Create a Reflector with same dimensions
-        const mirrorGeometry = new PlaneGeometry(planeWidth, planeHeight)
-        const reflector = new Reflector(mirrorGeometry, {
-          clipBias: 0.003,
-          textureWidth: window.innerWidth * window.devicePixelRatio,
-          textureHeight: window.innerHeight * window.devicePixelRatio,
-          color: 0x889999,
-        })
+        // Determine if we should use curved mirror or flat reflector
+        const useCurvedMirror = Math.abs(this.#guiObj.mirrorCurvature) > 0.001
         
-        // Copy position, rotation, and scale from the original plane
-        child.updateWorldMatrix(true, false)
-        reflector.position.copy(child.getWorldPosition(new Vector3()))
-        reflector.quaternion.copy(child.getWorldQuaternion(new Quaternion()))
-        reflector.scale.copy(child.getWorldScale(new Vector3()))
+        let reflector
+        
+        if (useCurvedMirror) {
+          // Create curved mirror with custom shader
+          console.log('Creating CURVED mirror with curvature:', this.#guiObj.mirrorCurvature)
+          const mirrorGeometry = this.createMirrorGeometry(planeWidth, planeHeight, this.#guiObj.mirrorShape)
+          
+          // Get world position for mirror center
+          child.updateWorldMatrix(true, false)
+          const mirrorPosition = child.getWorldPosition(new Vector3())
+          
+          const curvedMaterial = this.createCurvedMirrorMaterial(mirrorPosition)
+          reflector = new Mesh(mirrorGeometry, curvedMaterial)
+          
+          // Copy position, rotation, and scale
+          reflector.position.copy(mirrorPosition)
+          reflector.quaternion.copy(child.getWorldQuaternion(new Quaternion()))
+          reflector.scale.copy(child.getWorldScale(new Vector3()))
+        } else {
+          // Create flat reflector (original behavior)
+          console.log('Creating FLAT mirror')
+          const mirrorGeometry = this.createMirrorGeometry(planeWidth, planeHeight, this.#guiObj.mirrorShape)
+          reflector = new Reflector(mirrorGeometry, {
+            clipBias: 0.003,
+            textureWidth: window.innerWidth * window.devicePixelRatio,
+            textureHeight: window.innerHeight * window.devicePixelRatio,
+            color: 0x889999,
+          })
+          
+          // Copy position, rotation, and scale from the original plane
+          child.updateWorldMatrix(true, false)
+          reflector.position.copy(child.getWorldPosition(new Vector3()))
+          reflector.quaternion.copy(child.getWorldQuaternion(new Quaternion()))
+          reflector.scale.copy(child.getWorldScale(new Vector3()))
+        }
         
         // Flip the mirror if needed (rotate 180° around Y axis)
         if (shouldFlip) {
@@ -368,8 +423,8 @@ export default class MainScene {
         
         this.#scene.add(reflector)
         
-        // Create a black backing plane (mirror's back side)
-        const backingGeometry = new PlaneGeometry(planeWidth, planeHeight)
+        // Create a black backing plane (mirror's back side) with same shape
+        const backingGeometry = this.createMirrorGeometry(planeWidth, planeHeight, this.#guiObj.mirrorShape)
         const backingMaterial = new MeshBasicMaterial({ 
           color: 0x000000,
           side: 1 // BackSide
@@ -423,6 +478,84 @@ export default class MainScene {
       console.warn('⚠️ NO MIRRORS FOUND! Make sure your plane objects are named "Mirror" (case insensitive)')
       console.table(foundObjects)
     }
+  }
+
+  /**
+   * Auto-fit camera to model
+   */
+  fitCameraToModel() {
+    if (!this.#model) return
+    
+    // Calculate bounding box of the model
+    const box = new Box3().setFromObject(this.#model)
+    const center = box.getCenter(new Vector3())
+    const size = box.getSize(new Vector3())
+    
+    // Get the max dimension
+    const maxDim = Math.max(size.x, size.y, size.z)
+    const fov = this.#camera.fov * (Math.PI / 180)
+    let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2))
+    
+    // Add some padding
+    cameraZ *= 1.5
+    
+    // Position camera
+    this.#camera.position.set(center.x + cameraZ * 0.5, center.y + cameraZ * 0.5, center.z + cameraZ)
+    this.#camera.lookAt(center)
+    
+    // Update controls target
+    if (this.#controls) {
+      this.#controls.target.copy(center)
+      this.#controls.update()
+    }
+    
+    console.log('Camera fitted to model:', {
+      center: center,
+      size: size,
+      cameraPosition: this.#camera.position
+    })
+  }
+
+  /**
+   * Create mirror geometry based on shape
+   */
+  createMirrorGeometry(width, height, shape) {
+    switch(shape) {
+      case 'circle':
+        // Use average of width and height as radius
+        const radius = (width + height) / 4
+        return new CircleGeometry(radius, 64)
+      
+      case 'oval':
+        // Create ellipse shape
+        const ellipse = new Shape()
+        const radiusX = width / 2
+        const radiusY = height / 2
+        ellipse.absellipse(0, 0, radiusX, radiusY, 0, Math.PI * 2, false, 0)
+        return new ShapeGeometry(ellipse)
+      
+      case 'rectangle':
+      default:
+        return new PlaneGeometry(width, height, 32, 32) // More segments for curvature
+    }
+  }
+
+  /**
+   * Create curved mirror material using custom shader
+   */
+  createCurvedMirrorMaterial(mirrorPosition) {
+    return new ShaderMaterial({
+      uniforms: {
+        uCameraPosition: { value: this.#camera.position.clone() },
+        envMap: { value: this.#cubeRenderTarget.texture },
+        curvature: { value: this.#guiObj.mirrorCurvature },
+        mirrorRadius: { value: this.#guiObj.mirrorRadius },
+        mirrorCenter: { value: mirrorPosition.clone() },
+      },
+      vertexShader: curvedMirrorVertexShader,
+      fragmentShader: curvedMirrorFragmentShader,
+      side: DoubleSide,
+    })
   }
 
   /**
@@ -490,7 +623,9 @@ export default class MainScene {
     const titleEl = document.querySelector('.main-title')
 
     const handleChange = () => {
-      if (this.#model) this.#model.position.y = this.#guiObj.y
+      if (this.#model) {
+        this.#model.position.y = this.#guiObj.y
+      }
       if (titleEl) titleEl.style.display = this.#guiObj.showTitle ? 'block' : 'none'
       
       // Toggle virtual camera markers
@@ -544,7 +679,8 @@ export default class MainScene {
     const gui = new GUI()
     
     // Model controls
-    gui.add(this.#guiObj, 'y', -3, 3).onChange(handleChange).name('Model Y Position')
+    const modelFolder = gui.addFolder('Model Controls')
+    modelFolder.add(this.#guiObj, 'y', -3, 3).onChange(handleChange).name('Y Position')
     
     // Visibility controls
     const visibilityFolder = gui.addFolder('Visibility')
@@ -555,9 +691,22 @@ export default class MainScene {
     
     // Mirror controls
     const mirrorFolder = gui.addFolder('Mirror Controls')
+    mirrorFolder.add(this.#guiObj, 'mirrorShape', ['rectangle', 'circle', 'oval']).name('Mirror Shape').onChange(() => {
+      // Recreate mirrors with new shape
+      console.log('Mirror shape changed to:', this.#guiObj.mirrorShape)
+      this.updateMirrorShapes()
+    })
+    mirrorFolder.add(this.#guiObj, 'mirrorCurvature', -1.0, 1.0, 0.01).name('Curvature (0=flat)').onChange(() => {
+      console.log('Mirror curvature changed to:', this.#guiObj.mirrorCurvature)
+      this.updateMirrorCurvature()
+    })
+    mirrorFolder.add(this.#guiObj, 'mirrorRadius', 1.0, 20.0, 0.1).name('Curvature Radius').onChange(() => {
+      this.updateMirrorCurvature()
+    })
     mirrorFolder.add(this.#guiObj, 'flipMirrors').name('Flip Mirrors').onChange(handleChange)
     mirrorFolder.add(this.#guiObj, 'mirrorWidth', 0.1, 3.0).name('Mirror Width').onChange(handleChange)
     mirrorFolder.add(this.#guiObj, 'mirrorHeight', 0.1, 3.0).name('Mirror Height').onChange(handleChange)
+    mirrorFolder.add(this.#guiObj, 'mirrorScale', 0.1, 5.0).name('Mirror Scale').onChange(handleChange)
     
     // Animation controls
     const animationFolder = gui.addFolder('Animation')
@@ -712,7 +861,8 @@ export default class MainScene {
       },
       scene: {
         background: this.#scene.background.getHex(),
-        modelYPosition: this.#guiObj.y
+        modelYPosition: this.#guiObj.y,
+        modelScale: this.#guiObj.modelScale
       },
       visibility: {
         showTitle: this.#guiObj.showTitle,
@@ -722,7 +872,11 @@ export default class MainScene {
       mirrorSettings: {
         flipMirrors: this.#guiObj.flipMirrors,
         mirrorWidth: this.#guiObj.mirrorWidth,
-        mirrorHeight: this.#guiObj.mirrorHeight
+        mirrorHeight: this.#guiObj.mirrorHeight,
+        mirrorScale: this.#guiObj.mirrorScale,
+        mirrorShape: this.#guiObj.mirrorShape,
+        mirrorCurvature: this.#guiObj.mirrorCurvature,
+        mirrorRadius: this.#guiObj.mirrorRadius
       },
       animation: {
         speed: this.#guiObj.animationSpeed,
@@ -830,6 +984,10 @@ export default class MainScene {
       this.#guiObj.flipMirrors = settings.mirrorSettings.flipMirrors ?? false
       this.#guiObj.mirrorWidth = settings.mirrorSettings.mirrorWidth ?? 1.0
       this.#guiObj.mirrorHeight = settings.mirrorSettings.mirrorHeight ?? 1.0
+      this.#guiObj.mirrorScale = settings.mirrorSettings.mirrorScale ?? 1.0
+      this.#guiObj.mirrorShape = settings.mirrorSettings.mirrorShape ?? 'rectangle'
+      this.#guiObj.mirrorCurvature = settings.mirrorSettings.mirrorCurvature ?? 0.0
+      this.#guiObj.mirrorRadius = settings.mirrorSettings.mirrorRadius ?? 5.0
     }
     
     if (settings.animation) {
@@ -857,6 +1015,10 @@ export default class MainScene {
     this.#guiObj.flipMirrors = false
     this.#guiObj.mirrorWidth = 1.0
     this.#guiObj.mirrorHeight = 1.0
+    this.#guiObj.mirrorScale = 1.0
+    this.#guiObj.mirrorShape = 'rectangle'
+    this.#guiObj.mirrorCurvature = 0.0
+    this.#guiObj.mirrorRadius = 5.0
     this.#guiObj.animationSpeed = 1.0
     this.#guiObj.animationTime = 0.0
     this.#guiObj.playAnimation = true
@@ -875,7 +1037,9 @@ export default class MainScene {
     // Manually trigger change handlers
     const titleEl = document.querySelector('.main-title')
     
-    if (this.#model) this.#model.position.y = this.#guiObj.y
+    if (this.#model) {
+      this.#model.position.y = this.#guiObj.y
+    }
     if (titleEl) titleEl.style.display = this.#guiObj.showTitle ? 'block' : 'none'
     
     if (this.#virtualCameraMarker) {
@@ -914,6 +1078,117 @@ export default class MainScene {
   }
 
   /**
+   * Update mirror shapes when shape changes
+   */
+  updateMirrorShapes() {
+    this.#dynamicMirrors.forEach((mirrorData) => {
+      const reflector = mirrorData.reflector
+      const backing = mirrorData.backing
+      const originalWidth = mirrorData.originalWidth
+      const originalHeight = mirrorData.originalHeight
+      
+      // Create new geometry with current shape
+      const newGeometry = this.createMirrorGeometry(originalWidth, originalHeight, this.#guiObj.mirrorShape)
+      
+      // Update reflector geometry
+      reflector.geometry.dispose() // Clean up old geometry
+      reflector.geometry = newGeometry
+      
+      // Update backing geometry
+      if (backing) {
+        backing.geometry.dispose()
+        backing.geometry = this.createMirrorGeometry(originalWidth, originalHeight, this.#guiObj.mirrorShape)
+      }
+    })
+    
+    console.log('Mirror shapes updated to:', this.#guiObj.mirrorShape)
+  }
+
+  /**
+   * Update mirror curvature - switch between flat and curved mirrors
+   */
+  updateMirrorCurvature() {
+    console.log('Updating mirror curvature to:', this.#guiObj.mirrorCurvature)
+    
+    const useCurvedMirror = Math.abs(this.#guiObj.mirrorCurvature) > 0.001
+    
+    this.#dynamicMirrors.forEach((mirrorData) => {
+      const reflector = mirrorData.reflector
+      const originalMesh = mirrorData.originalMesh
+      
+      // Check if we need to switch mirror type
+      const isCurvedMaterial = reflector.material && reflector.material.uniforms && reflector.material.uniforms.curvature
+      
+      if (useCurvedMirror && !isCurvedMaterial) {
+        // Switch from flat to curved
+        console.log('Switching to CURVED mirror for:', mirrorData.name)
+        
+        // Dispose old material
+        if (reflector.material && reflector.material.dispose) {
+          reflector.material.dispose()
+        }
+        
+        // Create new curved material
+        const curvedMaterial = this.createCurvedMirrorMaterial(reflector.position)
+        reflector.material = curvedMaterial
+        
+      } else if (!useCurvedMirror && isCurvedMaterial) {
+        // Switch from curved to flat
+        console.log('Switching to FLAT mirror for:', mirrorData.name)
+        
+        // Need to recreate as Reflector
+        // This is complex, so just recreate all mirrors
+        this.recreateAllMirrors()
+        return
+      } else if (useCurvedMirror && isCurvedMaterial) {
+        // Already curved, just update uniforms
+        console.log('Updating curved mirror uniforms for:', mirrorData.name)
+        if (reflector.material.uniforms.curvature) {
+          reflector.material.uniforms.curvature.value = this.#guiObj.mirrorCurvature
+        }
+        if (reflector.material.uniforms.mirrorRadius) {
+          reflector.material.uniforms.mirrorRadius.value = this.#guiObj.mirrorRadius
+        }
+      }
+    })
+  }
+  
+  /**
+   * Recreate all mirrors from scratch
+   */
+  recreateAllMirrors() {
+    console.log('Recreating all mirrors...')
+    
+    // Clear existing dynamic mirrors
+    this.#dynamicMirrors.forEach((mirrorData) => {
+      this.#scene.remove(mirrorData.reflector)
+      this.#scene.remove(mirrorData.backing)
+      this.#scene.remove(mirrorData.marker)
+      
+      if (mirrorData.reflector.geometry) mirrorData.reflector.geometry.dispose()
+      if (mirrorData.reflector.material) {
+        if (mirrorData.reflector.material.dispose) {
+          mirrorData.reflector.material.dispose()
+        }
+      }
+      if (mirrorData.backing.geometry) mirrorData.backing.geometry.dispose()
+      if (mirrorData.backing.material) mirrorData.backing.material.dispose()
+      if (mirrorData.marker.geometry) mirrorData.marker.geometry.dispose()
+      if (mirrorData.marker.material) mirrorData.marker.material.dispose()
+      
+      // Show original mesh again
+      if (mirrorData.originalMesh) {
+        mirrorData.originalMesh.visible = true
+      }
+    })
+    
+    this.#dynamicMirrors = []
+    
+    // Recreate mirrors with new settings
+    this.createMirrorsFromModel()
+  }
+
+  /**
    * List of events
    */
   events() {
@@ -934,6 +1209,29 @@ export default class MainScene {
     this.#stats.begin()
 
     if (this.#controls) this.#controls.update() // for damping
+    
+    // Update CubeCamera for environment reflections (for curved mirrors)
+    if (this.#cubeCamera && this.#cubeRenderTarget && Math.abs(this.#guiObj.mirrorCurvature) > 0.001) {
+      // Position cube camera at scene center for better environment capture
+      this.#cubeCamera.position.set(0, 0, 0)
+      
+      // Hide mirrors temporarily to avoid recursive reflections
+      this.#dynamicMirrors.forEach((mirrorData) => {
+        if (mirrorData.reflector) {
+          mirrorData.reflector.visible = false
+        }
+      })
+      
+      // Update cube camera
+      this.#cubeCamera.update(this.#renderer, this.#scene)
+      
+      // Show mirrors again
+      this.#dynamicMirrors.forEach((mirrorData) => {
+        if (mirrorData.reflector) {
+          mirrorData.reflector.visible = true
+        }
+      })
+    }
     
     // Update animation mixer
     if (this.#mixer) {
@@ -1004,9 +1302,9 @@ export default class MainScene {
         // Apply custom scale from GUI
         const baseScale = originalMesh.getWorldScale(new Vector3())
         reflector.scale.set(
-          baseScale.x * this.#guiObj.mirrorWidth,
-          baseScale.y * this.#guiObj.mirrorHeight,
-          baseScale.z
+          baseScale.x * this.#guiObj.mirrorWidth * this.#guiObj.mirrorScale,
+          baseScale.y * this.#guiObj.mirrorHeight * this.#guiObj.mirrorScale,
+          baseScale.z * this.#guiObj.mirrorScale
         )
         
         // Update backing plane to match reflector
@@ -1015,6 +1313,22 @@ export default class MainScene {
           backing.quaternion.copy(reflector.quaternion)
           backing.scale.copy(reflector.scale)
           backing.translateZ(-0.01) // Keep it slightly behind
+        }
+      }
+      
+      // Update curved mirror material uniforms if using custom shader
+      if (reflector.material && reflector.material.uniforms) {
+        if (reflector.material.uniforms.uCameraPosition) {
+          reflector.material.uniforms.uCameraPosition.value.copy(this.#camera.position)
+        }
+        if (reflector.material.uniforms.curvature) {
+          reflector.material.uniforms.curvature.value = this.#guiObj.mirrorCurvature
+        }
+        if (reflector.material.uniforms.mirrorRadius) {
+          reflector.material.uniforms.mirrorRadius.value = this.#guiObj.mirrorRadius
+        }
+        if (reflector.material.uniforms.mirrorCenter) {
+          reflector.material.uniforms.mirrorCenter.value.copy(reflector.position)
         }
       }
       

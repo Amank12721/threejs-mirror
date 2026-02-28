@@ -1,17 +1,20 @@
 # Three.js Mirror Reflection System
 
-A real-time mirror reflection system built with Three.js and Vite. Supports dynamic mirrors from GLB files with virtual camera visualization.
+A real-time mirror reflection system built with Three.js and Vite. Supports dynamic mirrors from GLB files with virtual camera visualization and curved mirror effects.
 
 ## Features
 
 - ✨ Real-time planar reflections using Three.js Reflector
 - 🪞 Dynamic mirror detection from GLB files (name objects "Mirror" or ending with "_mirror")
+- 🔮 Curved mirrors support (convex/concave) with custom shaders
 - 📹 Virtual camera visualization (shows where reflection camera is positioned)
-- 🎛️ GUI controls for mirror customization (flip, width, height)
+- 🎛️ GUI controls for mirror customization (flip, width, height, scale, shape, curvature)
+- 🔷 Multiple mirror shapes (rectangle, circle, oval)
 - 🎬 Animation controls (play/pause, speed, timeline scrubbing)
 - 💾 Export/Import settings as JSON
 - 🔄 LocalStorage auto-save
 - 📦 Export scene to GLB
+- 📐 Auto-fit camera to model
 
 ## Installation
 
@@ -49,16 +52,26 @@ npm run build
 
 ### GUI Controls
 
+**Model Controls:**
+- Y Position (-3 to 3)
+
 **Visibility:**
 - Show Title
-- Show Virtual Cameras (red/blue wireframe boxes)
+- Show Virtual Cameras (colored wireframe boxes)
 - Show Manual Mirrors
-- Show Axes Helper
+- Show Axes Helper (RGB arrows)
 
 **Mirror Controls:**
+- Mirror Shape (rectangle, circle, oval)
+- Curvature (-1.0 to 1.0)
+  - 0 = Flat mirror (default)
+  - Positive = Convex mirror (curves outward)
+  - Negative = Concave mirror (curves inward)
+- Curvature Radius (1.0 to 20.0)
 - Flip Mirrors (180° rotation)
 - Mirror Width (0.1 - 3.0)
 - Mirror Height (0.1 - 3.0)
+- Mirror Scale (0.1 - 5.0)
 
 **Animation:**
 - Play Animation (checkbox)
@@ -72,6 +85,15 @@ npm run build
 - Reset to Default
 
 ## How It Works
+
+### Flat Mirrors (Curvature = 0)
+Uses Three.js Reflector class for accurate planar reflections.
+
+### Curved Mirrors (Curvature ≠ 0)
+Uses custom GLSL shaders with:
+- CubeCamera for environment capture
+- Ray tracing for curved surface reflections
+- Dynamic normal modification based on curvature
 
 ### Virtual Camera
 Each mirror creates a virtual camera positioned symmetrically on the opposite side:
@@ -97,6 +119,7 @@ Settings are automatically saved to localStorage and restored on page load.
 - Vite - Build tool
 - lil-gui - GUI controls
 - Stats.js - Performance monitoring
+- Custom GLSL shaders - Curved mirror effects
 
 ## License
 
